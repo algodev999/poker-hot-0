@@ -16,6 +16,7 @@
 - X: https://x.com/poker44subnet
 - Web: https://poker44.net
 - Whitepaper: https://poker44.net/Poker44_Whitepaper.pdf
+- Model repo: https://github.com/algodev999/poker-hot-0
 
 ---
 
@@ -110,15 +111,28 @@ This does not change validator scoring or on-chain `set_weights`. It adds:
 - transparency metadata
 - evaluation observability
 
-Recommended manifest fields include:
+The published `poker44_bump` package now exposes this manifest directly:
 
-- repo URL
-- repo commit or tag
-- model name and version
-- framework
-- license
-- training-data statement
-- data-handling attestation
+```python
+from poker44_bump import get_model_manifest
+
+synapse.model_manifest = get_model_manifest()
+```
+
+Current manifest identity for this hotkey:
+
+- repo URL: https://github.com/algodev999/poker-hot-0
+- repo commit: `fff7485`
+- model name: `poker44-hot-0-bump`
+- model version: `2026-07-02-hot-0`
+- framework: `scikit-learn/joblib`
+- license: `MIT`
+- calibration head: `conformal-maxhuman`
+- training-data statement: private Poker44 benchmark-derived training data; no secrets or raw private data are published in this repo.
+- data-handling attestation: miner-visible payload features only; production evaluation data is supplied by Poker44 platform infrastructure.
+
+Deployments may override `repo_url` and `repo_commit` with `POKER44_MODEL_REPO_URL`
+and `POKER44_MODEL_REPO_COMMIT` when publishing a new tag or commit.
 
 ---
 

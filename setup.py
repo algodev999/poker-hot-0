@@ -53,7 +53,7 @@ setup(
     description="Poker44 – Poker bot detection subnet for Bittensor",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/Poker44/Poker44-subnet",
+    url="https://github.com/algodev999/poker-hot-0",
     author="Poker44 contributors",
     author_email="",
     license="MIT",
