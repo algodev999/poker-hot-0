@@ -1,168 +1,124 @@
-"""Reference Poker44 miner with simple chunk-level behavioral heuristics."""
+"""Poker44 miner — hot-0 · CONFORMAL max-human calibration.
 
-# from __future__ import annotations
+Tree ensemble (LightGBM + XGBoost + ExtraTrees + RandomForest) over signature-
+collision chunk features, with a fixed-threshold conformal head (see
+poker44_bump/head.py). The decision threshold T is fitted at train time to sit
+just above the worst recent human score, so chunk FPR stays under the validator's
+10% cliff. The model artifact is hot-reloaded whenever the daily retrain job
+rewrites it — no restart needed.
 
+Wallet / hotkey / axon port are supplied on the command line by the pm2
+ecosystem config, which reads them from this project's .env.
+"""
+# NOTE: no `from __future__ import annotations` — bittensor's axon.attach()
+# introspects forward()'s annotations at runtime with issubclass().
+import os
+import sys
 import time
-from collections import Counter
+import hashlib
 from pathlib import Path
 from typing import Tuple
 
+_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_ROOT))  # prefer this project's local poker44 / poker44_bump
+
 import bittensor as bt
+import joblib
 
 from poker44.base.miner import BaseMinerNeuron
-from poker44.utils.model_manifest import (
-    build_local_model_manifest,
-    evaluate_manifest_compliance,
-    manifest_digest,
-)
 from poker44.validator.synapse import DetectionSynapse
+from poker44_bump import head as scoring_head
 
 
-class Miner(BaseMinerNeuron):
-    """
-    Reference heuristic miner.
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for blk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(blk)
+    return h.hexdigest()
 
-    It aggregates simple behavior signals over each chunk and returns a bot-risk
-    score per chunk. The goal is not SOTA accuracy, but a deterministic and
-    explainable baseline that is meaningfully better than random.
-    """
+
+class ConformalMiner(BaseMinerNeuron):
+    """Fixed-T conformal miner (hot-0)."""
 
     def __init__(self, config=None):
-        super(Miner, self).__init__(config=config)
-        bt.logging.info("🤖 Heuristic Poker44 Miner started")
-        repo_root = Path(__file__).resolve().parents[1]
-        self.model_manifest = build_local_model_manifest(
-            repo_root=repo_root,
-            implementation_files=[Path(__file__).resolve()],
-            defaults={
-                "model_name": "poker44-reference-heuristic",
-                "model_version": "1",
-                "framework": "python-heuristic",
-                "license": "MIT",
-                "repo_url": "https://github.com/Poker44/Poker44-subnet",
-                "notes": "Reference heuristic miner shipped with the Poker44 subnet.",
-                "open_source": True,
-                "inference_mode": "remote",
-                "training_data_statement": (
-                    "Reference heuristic miner. No training step. Uses only runtime chunk features."
-                ),
-                "training_data_sources": ["none"],
-                "private_data_attestation": (
-                    "This reference miner does not train on validator-only evaluation data."
-                ),
-            },
+        super().__init__(config=config)
+        self.model_path = Path(os.getenv("POKER44_BUMP_MODEL", str(_ROOT / "models" / "bump_model.joblib")))
+        self._model = None
+        self._model_mtime = 0.0
+        self._load_model()
+        bt.logging.info(
+            f"🂡 hot-0 CONFORMAL miner up | head={scoring_head.HEAD_NAME} "
+            f"T={self._model.threshold:.4f} feats={len(self._model.feature_names)} "
+            f"oof_ap={self._model.metadata.get('oof_ap')}"
         )
-        self.manifest_compliance = evaluate_manifest_compliance(self.model_manifest)
-        self.manifest_digest = manifest_digest(self.model_manifest)
-        self._log_manifest_startup(repo_root)
-        
-        # # Attach handlers after initialization
-        # self.axon.attach(
-        #     forward_fn = self.forward,
-        #     blacklist_fn = self.blacklist,
-        #     priority_fn = self.priority,
-        # )
-        # bt.logging.info("Attaching forward function to miner axon.")
-        
-        bt.logging.info(f"Axon created: {self.axon}")
 
-    def _log_manifest_startup(self, repo_root: Path) -> None:
-        bt.logging.info("Open-sourced miner manifest standard active for this miner.")
-        bt.logging.info(
-            f"Miner transparency status: {self.manifest_compliance['status']} "
-            f"(missing_fields={self.manifest_compliance['missing_fields']})"
-        )
-        bt.logging.info(
-            f"Manifest summary | model={self.model_manifest.get('model_name', '')} "
-            f"version={self.model_manifest.get('model_version', '')} "
-            f"repo={self.model_manifest.get('repo_url', '')} "
-            f"commit={self.model_manifest.get('repo_commit', '')} "
-            f"open_source={self.model_manifest.get('open_source')}"
-        )
-        bt.logging.info(
-            f"Manifest digest={self.manifest_digest} "
-            f"inference_mode={self.model_manifest.get('inference_mode', '')}"
-        )
-        bt.logging.info(
-            "Miner prep docs available | "
-            f"miner_doc={repo_root / 'docs' / 'miner.md'}"
-        )
+    # ---- model lifecycle (hot-reload on daily retrain) ----
+    def _load_model(self) -> None:
+        self._model = joblib.load(self.model_path)
+        self._model_mtime = self.model_path.stat().st_mtime
+        md = self._model.metadata
+        self.model_manifest = {
+            "schema_version": "1",
+            "open_source": True,
+            "repo_url": os.getenv("POKER44_MODEL_REPO_URL", ""),
+            "model_name": "poker44-conformal-maxhuman",
+            "model_version": md.get("model_version", "conformal-v1"),
+            "framework": "tree-ensemble+conformal-maxhuman",
+            "license": "MIT",
+            "inference_mode": "local-joblib",
+            "scoring_head": scoring_head.HEAD_NAME,
+            "training_data_statement": (
+                f"Trained on {md.get('benchmark_rows', '?')} released benchmark chunks; "
+                f"fixed-T conformal head T={md.get('conformal_threshold')}."
+            ),
+            "training_data_sources": md.get("training_data_sources") or ["released_training_benchmark"],
+            "private_data_attestation": "No validator-private data used; released benchmark labels only.",
+            "artifact_sha256": _sha256(self.model_path),
+            "oof_ap": md.get("oof_ap"),
+        }
+
+    def _maybe_reload(self) -> None:
+        try:
+            mtime = self.model_path.stat().st_mtime
+            if mtime > self._model_mtime:
+                bt.logging.info("detected refreshed artifact — hot-reloading model")
+                self._load_model()
+        except FileNotFoundError:
+            pass
 
     async def forward(self, synapse: DetectionSynapse) -> DetectionSynapse:
-        """Assign one deterministic bot-risk score per chunk."""
-        chunks = synapse.chunks or []
-        scores = [self.score_chunk(chunk) for chunk in chunks]
+        self._maybe_reload()
+        chunks = [list(c or []) for c in (synapse.chunks or [])]
+        t0 = time.perf_counter()
+        try:
+            raw = self._model.predict_raw(chunks)
+            scores = scoring_head.score_batch(raw, threshold=self._model.threshold)
+        except Exception as err:
+            bt.logging.warning(f"scoring failed ({err}); returning 0.5 for all chunks")
+            scores = [0.5] * len(chunks)
+        scores = [max(0.0, min(1.0, float(s))) for s in scores]
         synapse.risk_scores = scores
         synapse.predictions = [s >= 0.5 for s in scores]
         synapse.model_manifest = dict(self.model_manifest)
-        bt.logging.info(f"Miner Predctions: {synapse.predictions}")
-        bt.logging.info(f"Scored {len(chunks)} chunks with heuristic risks.")
+        dt = (time.perf_counter() - t0) * 1000.0
+        bt.logging.info(
+            f"[hot-0/conformal] scored {len(chunks)} chunks in {dt:.1f}ms | "
+            f"bots={sum(synapse.predictions)} "
+            f"range=[{min(scores) if scores else 0:.3f},{max(scores) if scores else 0:.3f}]"
+        )
         return synapse
 
-    @staticmethod
-    def _clamp01(value: float) -> float:
-        return max(0.0, min(1.0, value))
-
-    @classmethod
-    def _score_hand(cls, hand: dict) -> float:
-        actions = hand.get("actions") or []
-        players = hand.get("players") or []
-        streets = hand.get("streets") or []
-        outcome = hand.get("outcome") or {}
-
-        action_counts = Counter(action.get("action_type") for action in actions)
-        meaningful_actions = max(
-            1,
-            sum(
-                action_counts.get(kind, 0)
-                for kind in ("call", "check", "bet", "raise", "fold")
-            ),
-        )
-
-        call_ratio = action_counts.get("call", 0) / meaningful_actions
-        check_ratio = action_counts.get("check", 0) / meaningful_actions
-        fold_ratio = action_counts.get("fold", 0) / meaningful_actions
-        raise_ratio = action_counts.get("raise", 0) / meaningful_actions
-        street_depth = len(streets) / 3.0
-        showdown_flag = 1.0 if outcome.get("showdown") else 0.0
-
-        player_count_signal = 0.0
-        if players:
-            player_count_signal = (6 - min(len(players), 6)) / 4.0
-
-        score = 0.0
-        score += 0.32 * street_depth
-        score += 0.22 * showdown_flag
-        score += 0.18 * cls._clamp01(call_ratio / 0.35)
-        score += 0.12 * cls._clamp01(check_ratio / 0.30)
-        score += 0.08 * cls._clamp01(player_count_signal)
-        score -= 0.18 * cls._clamp01(fold_ratio / 0.55)
-        score -= 0.10 * cls._clamp01(raise_ratio / 0.20)
-
-        return cls._clamp01(score)
-
-    @classmethod
-    def score_chunk(cls, chunk: list[dict]) -> float:
-        if not chunk:
-            return 0.5
-
-        hand_scores = [cls._score_hand(hand) for hand in chunk]
-        avg_score = sum(hand_scores) / len(hand_scores)
-
-        return round(cls._clamp01(avg_score), 6)
-
     async def blacklist(self, synapse: DetectionSynapse) -> Tuple[bool, str]:
-        """Determine whether to blacklist incoming requests."""
         return self.common_blacklist(synapse)
 
     async def priority(self, synapse: DetectionSynapse) -> float:
-        """Assign priority based on caller's stake."""
         return self.caller_priority(synapse)
 
 
 if __name__ == "__main__":
-    with Miner() as miner:
-        bt.logging.info("Random miner running...")
+    with ConformalMiner() as miner:
+        bt.logging.info("hot-0 conformal miner running...")
         while True:
-            bt.logging.info(f"Miner UID: {miner.uid} | Incentive: {miner.metagraph.I[miner.uid]}")
-            time.sleep(5 * 60)
+            bt.logging.info(f"UID {miner.uid} | Incentive {miner.metagraph.I[miner.uid]}")
+            time.sleep(300)
